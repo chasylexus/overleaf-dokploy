@@ -1,0 +1,140 @@
+version: "3.8"
+
+services:
+  # Overleaf Community Edition application
+  # Built locally by Dokploy using the Dockerfile
+  sharelatex:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+
+    # Ensure dependencies are ready before starting Overleaf
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      mongo-init:
+        condition: service_completed_successfully
+
+    environment:
+      # Canonical public URL of the service (must be HTTPS in production)
+      OVERLEAF_SITE_URL: ${OVERLEAF_SITE_URL}
+
+      # Display name shown in the UI
+      OVERLEAF_APP_NAME: ${OVERLEAF_APP_NAME:-Overleaf}
+
+      # Internal service connections
+      OVERLEAF_MONGO_URL: mongodb://mongo/sharelatex
+      OVERLEAF_REDIS_HOST: redis
+      REDIS_HOST: redis
+
+      # Secure defaults: no public registration, no anonymous access
+      OVERLEAF_ALLOW_PUBLIC_ACCESS: ${OVERLEAF_ALLOW_PUBLIC_ACCESS:-false}
+      OVERLEAF_ALLOW_ANONYMOUS_READ: ${OVERLEAF_ALLOW_ANONYMOUS_READ:-false}
+      OVERLEAF_ALLOW_ANONYMOUS_WRITE: ${OVERLEAF_ALLOW_ANONYMOUS_WRITE:-false}
+
+      # Email functionality disabled by default (SMTP not configured)
+      EMAIL_CONFIRMATION_DISABLED: ${EMAIL_CONFIRMATION_DISABLED:-true}
+
+    # Internal HTTP port (external routing handled by Dokploy / Traefik)
+    expose:
+      - "80"
+
+    # Persistent application data (projects, uploads, etc.)
+    volumes:
+      - overleaf_data:/var/lib/overleaf
+
+    networks:
+      - dokploy-network
+
+
+  # MongoDB 8.0
+  # Overleaf requires MongoDB >= 8.0 and a replica set (for oplog support)
+  mongo:
+    image: mongo:8.0
+    restart: unless-stopped
+
+    # Start MongoDB as a single-node replica set
+    command: ["mongod", "--replSet", "overleaf", "--bind_ip_all"]
+
+    expose:
+      - "27017"
+
+    volumes:
+      - mongo_data:/data/db
+
+    # Healthcheck ensures MongoDB is responsive before dependent services start
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'db.stats().ok' | mongosh localhost:27017/test --quiet | grep -q 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+    networks:
+      - dokploy-network
+
+
+  # One-shot MongoDB replica set initialization
+  # This container runs once and exits successfully when the replica set is ready
+  mongo-init:
+    image: mongo:8.0
+    restart: "no"
+
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+    command: >
+      bash -lc '
+      for i in {1..60}; do
+        mongosh --host mongo:27017 --quiet --eval "
+          try {
+            const st = rs.status();
+            if (st.ok === 1) { quit(0); }
+          } catch (e) {}
+          rs.initiate({_id:\"overleaf\", members:[{_id:0, host:\"mongo:27017\"}]});
+        " && exit 0;
+        sleep 2;
+      done;
+      echo \"mongo-init failed\"; exit 1
+      '
+
+    networks:
+      - dokploy-network
+
+
+  # Redis used for sessions and caching
+  redis:
+    image: redis:6.2
+    restart: unless-stopped
+
+    # Enable append-only persistence
+    command: ["redis-server", "--appendonly", "yes"]
+
+    expose:
+      - "6379"
+
+    volumes:
+      - redis_data:/data
+
+    networks:
+      - dokploy-network
+
+
+volumes:
+  # Overleaf application data
+  overleaf_data:
+
+  # MongoDB persistent storage
+  mongo_data:
+
+  # Redis persistent storage
+  redis_data:
+
+
+networks:
+  # External Docker network managed by Dokploy
+  dokploy-network:
+    external: true
